@@ -1,0 +1,319 @@
+name: Update
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  # A human change to the package (a fix for a flagged release, a pkgrel
+  # bump, a launcher edit) must reach AUR too. Pushes made by this
+  # workflow use the built-in token, which never triggers workflows.
+  push:
+    branches: [master]
+    paths: [PKGBUILD, .SRCINFO, claude-desktop.sh]
+  workflow_dispatch:
+    inputs:
+      # Manual runs are safe unless explicitly made real. Scheduled runs
+      # have no inputs, so they are always real.
+      dry_run:
+        description: Run every step except the two git pushes
+        type: boolean
+        default: true
+
+# Two overlapping runs could both publish the same version. Queue them
+# instead, and never cancel a run that may be halfway through publishing.
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+# No access by default: each job asks only for what it uses.
+permissions: {}
+
+defaults:
+  run:
+    # Explicit bash runs steps with -e and -o pipefail.
+    shell: bash
+
+jobs:
+  # Runs every 30 minutes, so it stays cheap: a plain Ubuntu runner
+  # already has everything the check needs (bash, curl, awk, grep, sort).
+  check:
+    # A push publishes the pushed files as they are: nothing to check.
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Step outputs stay inside their job unless mapped here.
+    outputs:
+      status: ${{ steps.check.outputs.status }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # Exit codes 0 (update), 3 (no update) and 4 (needs review) are
+      # normal outcomes and keep the job green. Anything else is an error
+      # and fails it. stdout can hold a version even on an error, so it is
+      # only saved for 0 and 4.
+      - name: Check for update
+        id: check
+        run: |
+          status=0
+          version="$(./scripts/check-update.sh)" || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          if [[ $status -eq 0 || $status -eq 4 ]]; then
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+          fi
+          [[ $status -eq 0 || $status -eq 3 || $status -eq 4 ]]
+
+  publish:
+    needs: check
+    # A skipped needed job skips this one too, unless the condition uses a
+    # status function. always() would also run it in a cancelled run;
+    # !cancelled() doesn't, so cancelling a run can still stop a publish.
+    if: ${{ !cancelled() && (github.event_name == 'push' || needs.check.outputs.status == '0') }}
+    runs-on: ubuntu-latest
+    # makepkg only exists on Arch Linux.
+    container: archlinux:base-devel
+    permissions:
+      contents: write
+    env:
+      # Same identity as the package's existing AUR history.
+      GIT_AUTHOR_NAME: Kevin Diaz
+      GIT_AUTHOR_EMAIL: developer@kev314.dev
+      GIT_COMMITTER_NAME: Kevin Diaz
+      GIT_COMMITTER_EMAIL: developer@kev314.dev
+      # "true" only for a manual run that kept the default.
+      DRY_RUN: ${{ inputs.dry_run == true }}
+    steps:
+      # Without git in the container, actions/checkout downloads a tarball
+      # with no .git folder, and later commits fail. openssh is for the
+      # AUR push.
+      - name: Install git
+        run: pacman -Syu --noconfirm --needed git openssh
+
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # makepkg refuses to run as root, and container jobs run as root.
+      # Git, which still runs as root, then refuses a workspace owned by
+      # another user unless it is marked as safe. makepkg --syncdeps runs
+      # "sudo pacman", so builder may run pacman as root, and nothing
+      # else. visudo -c rejects a broken rule before sudo has to read it.
+      - name: Create build user
+        run: |
+          useradd --create-home builder
+          chown -R builder: "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo 'builder ALL=(root) NOPASSWD: /usr/bin/pacman' > /etc/sudoers.d/builder
+          chmod 0440 /etc/sudoers.d/builder
+          visudo -cf /etc/sudoers.d/builder
+
+      # On a push, the pushed files are the release, and the AUR commit
+      # reuses the human's commit subject. Otherwise this checks again
+      # instead of trusting the check job, since a newer release may have
+      # landed in between. A 3 or 4 here stops cleanly (later steps only
+      # run on 0), and the next scheduled run sorts it out.
+      - name: Prepare release
+        id: release
+        run: |
+          if [[ $GITHUB_EVENT_NAME == push ]]; then
+            # AUR doesn't check that .SRCINFO matches the PKGBUILD, so a
+            # forgotten regeneration would publish stale metadata.
+            fresh="$(sudo -u builder makepkg --printsrcinfo)"
+            if [[ $fresh != "$(< .SRCINFO)" ]]; then
+              echo "::error::.SRCINFO is out of date. Run makepkg --printsrcinfo > .SRCINFO, commit and push again."
+              exit 1
+            fi
+            echo "status=0" >> "$GITHUB_OUTPUT"
+            echo "message=$(git log -1 --format=%s)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          status=0
+          version="$(sudo -u builder ./scripts/check-update.sh --apply)" || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          if [[ $status -eq 0 ]]; then
+            echo "message=chore: upgrade to $version" >> "$GITHUB_OUTPUT"
+          fi
+          [[ $status -eq 0 || $status -eq 3 || $status -eq 4 ]]
+
+      - name: Show changes
+        if: steps.release.outputs.status == '0'
+        run: git diff
+
+      # The container is a fresh Arch install on every run, so it gives
+      # the same guarantee as a clean chroot: only what the PKGBUILD
+      # declares gets installed. makepkg downloads the .deb and verifies
+      # it against the checksum --apply wrote. Only x86_64 is built,
+      # because the runner is x86_64.
+      - name: Build package
+        if: steps.release.outputs.status == '0'
+        run: sudo -u builder makepkg --syncdeps --noconfirm
+
+      # namcap is noisy, and the PKGBUILD explains its "may not be
+      # needed" warnings. Only fail when a binary links a library that
+      # no declared dependency provides, even indirectly: a version bump
+      # can sneak one in. namcap reports that in one of two ways:
+      #  - "detected and not included" when the library is installed, so
+      #    namcap knows which package owns it;
+      #  - "Referenced library '...' is an uninstalled dependency" when it
+      #    isn't installed. The fresh container only has what depends
+      #    pulled in, so a missing dependency usually shows up this way.
+      #    The same message also covers script shebangs ('bash', 'sh'),
+      #    which are always present, so only shared libraries (.so) count.
+      - name: Inspect package
+        if: steps.release.outputs.status == '0'
+        run: |
+          pacman -S --noconfirm --needed namcap
+          package="$(sudo -u builder makepkg --packagelist)"
+          report="$(namcap "$package")"
+          printf '%s\n' "$report"
+          if grep -q 'detected and not included' <<< "$report" \
+            || grep -Eq "Referenced library '[^']*\.so[^']*' is an uninstalled dependency" <<< "$report"; then
+            echo "::error::namcap found dependencies missing from depends"
+            exit 1
+          fi
+
+      # AUR goes first. If GitHub then fails, users already have the
+      # update, and the next run still sees the old version on GitHub,
+      # finds AUR already up to date, and pushes GitHub. The other order
+      # could leave AUR behind forever. So this step must be idempotent:
+      # a fresh clone that already matches means nothing to do.
+      # AUR rejects subdirectories, so only the package files are copied.
+      - name: Publish to AUR
+        if: steps.release.outputs.status == '0'
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          # Passed through env, never inlined with ${{ }}: a commit
+          # subject is text a human typed, and inlining it would splice
+          # it into the script itself.
+          MESSAGE: ${{ steps.release.outputs.message }}
+        run: |
+          key="$RUNNER_TEMP/aur_key"
+          trap 'rm -f "$key"' EXIT
+          # umask makes the file private from the moment it exists.
+          (umask 077 && printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$key")
+          # Pinned host keys: never trust whatever server answers.
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$GITHUB_WORKSPACE/.github/aur_known_hosts"
+
+          aur="$RUNNER_TEMP/aur"
+          git clone ssh://aur@aur.archlinux.org/claude-desktop.git "$aur"
+          cp PKGBUILD .SRCINFO claude-desktop.sh "$aur/"
+          cd "$aur"
+          git add PKGBUILD .SRCINFO claude-desktop.sh
+          if git diff --cached --quiet; then
+            echo "No changes for AUR, skipping commit"
+            exit 0
+          fi
+          git commit -m "$MESSAGE"
+          # act sets ACT=true. Whatever event it simulates, a local test
+          # must never publish.
+          if [[ $DRY_RUN == true || -n ${ACT:-} ]]; then
+            echo "Dry run: would push to AUR:"
+            git show --stat HEAD
+          else
+            git push origin master
+          fi
+
+      # Only the files --apply changed, added by name: the build leaves
+      # src/, pkg/ and the .deb in the workspace. Commits made with the
+      # built-in token don't trigger workflows, so this can't loop.
+      # Skipped on a push: the human's push already put the files there.
+      - name: Push to GitHub
+        if: steps.release.outputs.status == '0' && github.event_name != 'push'
+        env:
+          MESSAGE: ${{ steps.release.outputs.message }}
+        run: |
+          git add PKGBUILD .SRCINFO
+          git commit -m "$MESSAGE"
+          # act sets ACT=true. Whatever event it simulates, a local test
+          # must never publish.
+          if [[ $DRY_RUN == true || -n ${ACT:-} ]]; then
+            echo "Dry run: would push to GitHub:"
+            git show --stat HEAD
+          else
+            git push origin "HEAD:$GITHUB_REF_NAME"
+          fi
+
+  # A release flagged for review (exit 4) becomes one issue per version,
+  # with the dependency changes and the steps to publish it by hand.
+  review:
+    needs: check
+    if: needs.check.outputs.status == '4'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      DRY_RUN: ${{ inputs.dry_run == true }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # Runs the check again, like publish does: the report comes from
+      # this run, not from what the check job saw. The script writes just
+      # the report to REPORT_FILE; its progress lines stay in the log.
+      - name: Open review issue
+        run: |
+          report="$RUNNER_TEMP/report"
+          status=0
+          version="$(REPORT_FILE="$report" ./scripts/check-update.sh)" || status=$?
+          case $status in
+            4) ;;
+            0 | 3)
+              echo "Status is now $status, not 4: nothing to review"
+              exit 0
+              ;;
+            *) exit 1 ;;
+          esac
+
+          # gh's --search is fuzzy (2.7032.0 can match 2.7032.1), so
+          # compare whole titles exactly. The titles are captured first:
+          # "gh ... | grep -q" could make gh fail with SIGPIPE when grep
+          # stops early, and pipefail would turn a match into a miss.
+          title="Claude Desktop \`$version\`: dependencies changed"
+          titles="$(gh issue list --state open --limit 1000 --json title --jq '.[].title')"
+          if grep -Fxq -- "$title" <<< "$titles"; then
+            echo "An open issue already exists: $title"
+            exit 0
+          fi
+
+          # Prints the issue body, with ISSUE (e.g. #12) in "closes".
+          # shellcheck disable=SC2016 # Markdown backticks, not commands
+          write_body() {
+            local issue="$1"
+            local command='`./scripts/check-update.sh --apply --reviewed`'
+            printf "Version %s wasn't published because its Debian dependencies changed.\n\n" "$version"
+            # A diff block keeps the - and + markers and colors them;
+            # plain Markdown would render both as identical bullets.
+            printf '```diff\n'
+            cat "$report"
+            printf '```\n'
+            printf '\nTo publish, update the PKGBUILD if needed, run %s, then commit with `chore: upgrade to %s, closes %s` and push.\n' \
+              "$command" "$version" "$issue"
+          }
+
+          # act sets ACT=true. A local test must never create issues.
+          if [[ $DRY_RUN == true || -n ${ACT:-} ]]; then
+            echo "Dry run: would create issue: $title"
+            write_body "#N"
+            exit 0
+          fi
+
+          # The issue number only exists once the issue does: create it,
+          # take the number from the URL gh prints, then set the final
+          # body. A failed edit still leaves a usable issue, so it only
+          # warns.
+          body="$RUNNER_TEMP/body.md"
+          write_body "#N" > "$body"
+          url="$(gh issue create --title "$title" --body-file "$body")"
+          echo "Created $url"
+          number="${url##*/}"
+          if [[ ! $number =~ ^[0-9]+$ ]]; then
+            echo "::warning::Created an issue, but could not read its number from '$url'"
+            exit 0
+          fi
+          write_body "#$number" > "$body"
+          if ! gh issue edit "$number" --body-file "$body"; then
+            echo "::warning::Created $url, but could not set its final body"
+          fi
