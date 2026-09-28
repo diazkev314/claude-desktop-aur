@@ -1,8 +1,10 @@
 name: Update
 
 on:
+  # Every 4 hours, at minute 17: scheduled runs at GitHub's busy :00
+  # slot can be delayed or dropped.
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "17 */4 * * *"
   # A human change to the package (a fix for a flagged release, a pkgrel
   # bump, a launcher edit) must reach AUR too. Pushes made by this
   # workflow use the built-in token, which never triggers workflows.
@@ -33,7 +35,7 @@ defaults:
     shell: bash
 
 jobs:
-  # Runs every 30 minutes, so it stays cheap: a plain Ubuntu runner
+  # Runs every 4 hours, so it stays cheap: a plain Ubuntu runner
   # already has everything the check needs (bash, curl, awk, grep, sort).
   check:
     # A push publishes the pushed files as they are: nothing to check.
@@ -210,7 +212,21 @@ jobs:
             echo "Dry run: would push to AUR:"
             git show --stat HEAD
           else
-            git push origin master
+            # AUR's SSH server sometimes closes the connection (run #16
+            # failed on push right after a successful clone). Retrying is
+            # safe: if a dropped push actually landed, the next attempt
+            # finds nothing to push and succeeds.
+            delays=(15 45)
+            for attempt in 1 2 3; do
+              if git push origin master; then
+                break
+              fi
+              echo "::warning::git push to AUR failed (attempt $attempt of 3)"
+              if (( attempt == 3 )); then
+                exit 1
+              fi
+              sleep "${delays[attempt - 1]}"
+            done
           fi
 
       # Only the files --apply changed, added by name: the build leaves

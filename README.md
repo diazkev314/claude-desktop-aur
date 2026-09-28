@@ -21,7 +21,7 @@ Anthropic releases new versions often. To keep the package current, updates are 
 ```mermaid
 flowchart TD
     A[Anthropic's apt repository] --> C{check}
-    S[Every 30 minutes] --> C
+    S[Every 4 hours] --> C
     C -->|up to date| N[Nothing to do]
     C -->|new version, same dependencies| P[publish]
     C -->|dependencies changed| R[review]
@@ -30,7 +30,7 @@ flowchart TD
     R --> I[GitHub issue for me]
 ```
 
-Every 30 minutes, the workflow compares the newest version in Anthropic's apt repository with the one in this repo. When there's a new release, it also compares the release's dependencies (`Pre-Depends`, `Depends`, `Recommends` and `Suggests`, for both amd64 and arm64) with the current version's.
+Every 4 hours, the workflow compares the newest version in Anthropic's apt repository with the one in this repo. When there's a new release, it also compares the release's dependencies (`Pre-Depends`, `Depends`, `Recommends` and `Suggests`, for both amd64 and arm64) with the current version's.
 
 - If nothing changed, it updates the PKGBUILD, builds the package in a clean Arch container, checks it with namcap, and pushes it to the AUR.
 - If something changed, it opens an issue instead. A dependency change needs a person to decide what it means on Arch, so those releases wait for me.
